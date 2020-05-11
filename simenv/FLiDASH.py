@@ -39,23 +39,19 @@ GROUP_JOIN_THRESHOLD = 10
 BYTES_IN_MB = 1000000.0
 
 LOG_LOCATION = "./results/"
-# NN_MODEL_QUA = "nn_model_ep_72500.ckpt"
-# NN_MODEL_AGE = "nn_model_ep_72500.ckpt"
 def default(o):
     if isinstance(o, np.int64): return int(o)
     raise TypeError
 
 class FLiDASH(Simple):
     def __init__(self, vi, traces, simulator, abr = None, grp = None, peerId = None, modelPath=None, *kw, **kws):
-        super().__init__(vi, traces, simulator, abr, peerId, *kw, **kws)
-#         self._vAgent = Agent(vi, self, abr)
+        super().__init__(vi=vi, traces=traces, simulator=simulator, abr=abr, peerId=peerId, *kw, **kws)
         self._vDownloadPending = False
-        self._vDownloadPendingRnnkey = None
-        self._vSegIdRNNKeyMap = {}
-        self._vSegmentDownloading = -1
+#         self._vDownloadPendingRnnkey = None
+#         self._vSegmentDownloading = -1
         self._vGroup = grp
         self._vCatched = {}
-        self._vOtherPeerRequest = {}
+#         self._vOtherPeerRequest = {}
         self._vTotalDownloaded = 0
         self._vTotalUploaded = 0
         self._vTotalUploadedSegs = 0
@@ -63,6 +59,7 @@ class FLiDASH(Simple):
         self._vFinished = False
         self._vModelPath = modelPath
         self._vRunWhenDownloadCompeltes = []
+        self._vEmailPass = open("emailpass.txt").read().strip()
 
         self._vGroupNodes = None
 
@@ -84,13 +81,11 @@ class FLiDASH(Simple):
         self._vNextGroupDLSegId = -1
         self._vWeightedThroughput = 0
         self._vDownloadQl = []
-#         self._vPensieveAgentLearner = None if not self._vModelPath  else rnnAgent.getPensiveLearner(list(range(5)), summary_dir = self._vModelPath, nn_model = NN_MODEL_AGE)
-#         self._vPensieveQualityLearner = None if not self._vModelPath  else rnnQuality.getPensiveLearner(list(range(len(self._vVideoInfo.bitrates))), \
-#                                             summary_dir = self._vModelPath, nn_model = NN_MODEL_QUA)
         self._vMaxSegDownloading = -1
         self._vSyncNow = False
         self._vLastSyncSeg = -1
         self._vSleepingSegs = {}
+        self._vSyncSegIds = set()
 
         self._vDeadLines = {}
         self._vDeadLineMissed = []
@@ -98,7 +93,10 @@ class FLiDASH(Simple):
         self._vWaitedFor = {}
         self._vGrpIds = []
 
+        self._vRPCCont = 0
 
+
+#=============================================
     @property
     def groupId(self):
         return self._vGroup.getId(self)
@@ -119,7 +117,6 @@ class FLiDASH(Simple):
 
 #=============================================
     def schedulesChanged(self, changedFrom, nodes, sched):
-#         self._vGroupNodes = nodes
         newNodes = [x for x in nodes if x._vPlayerIdInGrp == -1]
         assert len(newNodes) == 1 #anything else is a disaster
         if newNodes[0] == self:
@@ -131,7 +128,6 @@ class FLiDASH(Simple):
         self._vGrpIds = [n.networkId for n in nodes]
         syncTime = self.now + 1
         self._vSimulator.runAt(syncTime, self._rSyncNow)
-#         self._vSimulator.runAt(syncTime, self._vAgent._rSyncNow)
 
 #=============================================
     def _rGroupStarted(self):
@@ -154,13 +150,54 @@ class FLiDASH(Simple):
 #=============================================
     def _rSyncComplete(self, segId):
         self._vSyncNow = False
+        assert segId not in self._vCatched
         self._vLastSyncSeg = segId
+        self._vSyncSegIds.add(segId)
+
+#=============================================
+    def _rFetchCompletePacket(self, req):
+        cacheReq = self._vCatched[req.segId]
+        if cacheReq != req and cacheReq.isComplete:
+            self._vAgent._rBufManAddCompleteReq(cacheReq)
+            return
+
+        assert req.downloader != self
+        assert req.downloader in self._vGroupNodes #Here i found a interesting result. There are certain time when we have better qualityIndex than orig req.
+
+        self.requestRpc(req.downloader._rSendOrigReq, req, self, len(self._vGroupNodes))
+
+#=============================================
+    def _rSendOrigReq(self, req, remote, depth):
+        if os.environ.get("EXPERIMENT_ENVIRON_RTT", None):
+            if remote == self and self._vCatched[req.segId].isComplete: #very special case Just needed to get for the paper
+                remote._rRecvOrigReq(self._vCatched[req.segId], self)
+                return
+        assert remote != self
+        assert depth
+        if self._vCatched[req.segId].downloader != self:
+            self.requestRpc(self._vCatched[req.segId].downloader._rSendOrigReq, req, remote, depth-1)
+            return
+
+        assert req.segId in self._vCatched and self._vCatched[req.segId].isComplete
+        reqOrig = self._vCatched[req.segId]
+        assert reqOrig.isComplete
+        if reqOrig.isComplete:
+            self._vTotalUploaded += reqOrig.clen
+            self._vTotalUploadedSegs += 1
+        self.requestLongRpc(remote._rRecvOrigReq, reqOrig.clen, reqOrig, self)
+
+#=============================================
+    def _rRecvOrigReq(self, req, node):
+        if req.segId in self._vSyncSegIds:
+            req.syncSeg = True
+        self._vAgent._rBufManAddCompleteReq(req)
 
 #=============================================
     def requestRpc(self, func, *argv, **kargv):
         node = func.__self__
         assert node != self
         delay = self._rGetRtt(node)
+        self._vRPCCont += 1
         self.runAfter(delay, node.recvRPC, func, self, *argv, **kargv)
 
 #=============================================
@@ -176,6 +213,7 @@ class FLiDASH(Simple):
         assert s == self and node.__class__ == self.__class__
         func(*argv, **kargv)
 
+#=============================================
     def gossipSend(self, func, *argv, **kargv):
         strfunc = func.__name__
         for node in self._vGroupNodes:
@@ -183,6 +221,7 @@ class FLiDASH(Simple):
                 continue
             self.requestRpc(node.gossipRcv, strfunc, *argv, **kargv)
 
+#=============================================
     def gossipRcv(self, strfunc, *argv, **kargv):
         func = self.__getattribute__(strfunc)
         func(*argv, **kargv)
@@ -205,7 +244,7 @@ class FLiDASH(Simple):
         thrpt = self._vThroughPutData[-5:]
         if curProg[1] > 0 and curProg[0] > 0:
             thrpt += [(self.now, curProg[1] * 8 / curProg[0])]
-        cur = [1/x for t, x in thrpt]
+        cur = [1/x for t, x in thrpt]  #harmonic average
         cur = len(cur)/sum(cur)
 
         thrpt = min(cur, thrpt[-1][1], self._vWeightedThroughput)
@@ -313,24 +352,30 @@ class FLiDASH(Simple):
             syncSeg = True
             self._rSetNextDownloader(playerId, segId, rnnkey, lastSegId, lastPlayerId, lastQl)
             return
-        elif segId == self._vLastSyncSeg:
+        elif segId == self._vLastSyncSeg or segId in self._vSyncSegIds:
             syncSeg = True
         elif self._vAgent.nextSegmentIndex > self._vLastSyncSeg:
-            #check if there are bufferAvailable in player
+            #check if there are bufferAvailable in player. This is wrong.
+            waitTimes = []
             segPlaybackTime = self._vVideoInfo.segmentDuration*segId
-            curPlaybackTime = self._vAgent.playbackTime
-            waitTime = max(0, segPlaybackTime - curPlaybackTime - self._vAgent._vMaxPlayerBufferLen)
+            for node in self._vGroupNodes:
+                if not node._vGroupStarted: continue
+                curPlaybackTime = node._vAgent.playbackTime
+                waitTime = max(0, segPlaybackTime - curPlaybackTime - node._vAgent._vMaxPlayerBufferLen + self._vVideoInfo.segmentDuration)
+                waitTimes += [waitTime]
+            waitTime = max(waitTimes)
             if waitTime > 0:
-                assert waitTime < 100
+#                 assert waitTime < 100
                 tmp = self._vWaitedFor.setdefault(segId, []).append((self.now, waitTime, "loc2"))
                 self.runAfter(waitTime, self._rSetNextDownloader, playerId, segId, rnnkey, lastSegId, lastPlayerId, lastQl)
                 return
+#         elif
 
         self._vNextGroupDownloader = playerId
         self._vNextGroupDLSegId = segId
         self._vGroupSegDetails.append((lastSegId, lastPlayerId, lastQl))
 
-        self._rDownloadAsTeamPlayer(segId, rnnkey = rnnkey, syncSeg = syncSeg)
+        self._rDownloadAsTeamPlayer(segId, rnnkey = rnnkey, syncSeg = syncSeg, ql=lastQl)
 
 #=============================================
     def _rDownloadAsTeamPlayer(self, segId, rnnkey = None, ql = -1, syncSeg = False):
@@ -382,7 +427,7 @@ class FLiDASH(Simple):
 
             self._rFetchSegment(segId, ql, extraData={"syncSeg":syncSeg})
             self._vDownloadPending = True
-            self._vDownloadPendingRnnkey = rnnkey
+#             self._vDownloadPendingRnnkey = rnnkey
             break
 
 #=============================================
@@ -409,6 +454,8 @@ class FLiDASH(Simple):
             del self._vSleepingSegs[nextSegId]
 
         if nextSegId in self._vCatched:
+            waitTime = max(self._vAgent._vMaxPlayerBufferLen - self._vAgent.bufferLeft, 0)
+#             if waitTime >
             self._rAddToAgentBuffer(self._vCatched[nextSegId])
             return
 
@@ -423,7 +470,7 @@ class FLiDASH(Simple):
             self._rDownloadAsTeamPlayer(nextSegId, ql = nextQuality)
             return
 
-        deadLine = (nextSegId-1) * self._vVideoInfo.segmentDuration - self._vAgent.playbackTime
+        deadLine = (nextSegId-1) * self._vVideoInfo.segmentDuration - min([x._vAgent.playbackTime for x in self._vGroupNodes if x._vGroupStarted])
         if deadLine > 0:
             self.runAfter(deadLine, self._rDeadlineReached, nextSegId)
         else:
@@ -431,10 +478,17 @@ class FLiDASH(Simple):
 
 #=============================================
     def _rAddToAgentBuffer(self, req, simIds=None):
+        if req.segId in self._vSyncSegIds:
+            req.syncSeg = True
         if self._vAgent.nextSegmentIndex > req.segId:
             return
         assert self._vAgent.nextSegmentIndex == req.segId or req.syncSeg
         if self._vAgent.nextSegmentIndex == req.segId:
+            if os.environ.get("EXPERIMENT_ENVIRON_RTT", None):
+                if req.segId in self._vCatched and (round(self._vAgent._vMaxPlayerBufferLen - self._vAgent.bufferLeft, 3) < self._vVideoInfo.segmentDuration and not req.syncSeg):
+                    wait = self._vVideoInfo.segmentDuration - (self._vAgent._vMaxPlayerBufferLen - self._vAgent.bufferLeft)
+                    self.runAfter(wait, self._rAddToAgentBuffer, req)
+                    return
             assert req.segId in self._vCatched and (round(self._vAgent._vMaxPlayerBufferLen - self._vAgent.bufferLeft, 3) >= self._vVideoInfo.segmentDuration or req.syncSeg)
 
         waitTime = self._vAgent.bufferAvailableIn()
@@ -445,22 +499,13 @@ class FLiDASH(Simple):
             return
         lastStalls = self._vAgent._vTotalStallTime
         self._vAgent._rAddToBufferInternal(req)
-        if req.segId in self._vSegIdRNNKeyMap:
-            rnnkey = self._vSegIdRNNKeyMap[req.segId]
-            del self._vSegIdRNNKeyMap[req.segId]
-            qoe = self._vAgent.QoE
-
-            qls = self._vAgent.bitratePlayed[-2:]
-
-            diff = abs(qls[0] - qls[1])/BYTES_IN_MB
-            rebuf = (self._vAgent._vTotalStallTime - lastStalls)/10
-            qoe = qls[1] / BYTES_IN_MB - diff - 4.3 * rebuf
-            #add reward
 
 #=============================================
     def _rAddToBuffer(self, req, simIds = None):
+        if req.segId in self._vSyncSegIds:
+            req.syncSeg = True
         self._vDownloadPending = False
-        rnnkey = self._vDownloadPendingRnnkey
+#         rnnkey = self._vDownloadPendingRnnkey
         self._rDownloadFromDownloadQueue()
         req.syncSeg = req.extraData.get("syncSeg", False)
         if self._vStarted:
@@ -495,7 +540,7 @@ class FLiDASH(Simple):
             self._vGroup.add(self, self._vAgent.nextSegmentIndex+2)
 
         if self._vGroupNodes:
-            self.gossipSend(self._rRecvReq, self, req)
+            self.gossipSend(self._rRecvReq, self, req.getIncompleteCopy())
 
 #=============================================
     def _rPushSyncSegInTime(self, req):
@@ -517,8 +562,9 @@ class FLiDASH(Simple):
             syncSeg = syncSeg or self._vCatched[req.segId].syncSeg
         if req.segId not in self._vCatched \
                 or req.qualityIndex > self._vCatched[req.segId].qualityIndex:
-            node._vTotalUploaded += req.clen
-            node._vTotalUploadedSegs += 1
+            if req.isComplete:
+                node._vTotalUploaded += req.clen
+                node._vTotalUploadedSegs += 1
             self._vCatched[req.segId] = req
         self._vCatched[req.segId].syncSeg = syncSeg
 

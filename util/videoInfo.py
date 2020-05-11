@@ -18,6 +18,7 @@
 
 import importlib
 import os
+import numpy as np
 
 GLOBAL_DELAY_PLAYBACK = 50 #Total arbit
 
@@ -40,6 +41,7 @@ class VideoInfo():
         s.bitrateReward = vi.bitrateReward
         s.birateRewardMap = {x:y for x, y in zip(s.bitrates, s.bitrateReward)}
         s.globalDelayPlayback = GLOBAL_DELAY_PLAYBACK
+        s.maxFileSize = np.amax(s.fileSizes)
 
     def getSegDuration(s, segId):
         assert segId < s.segmentCount
@@ -68,6 +70,7 @@ class PenseivVideoInfo():
         s.bitrateReward = vi.bitrateReward if len(vi.sizes) != 8 else [1, 2, 3, 12, 15, 20]
         s.birateRewardMap = {x:y for x, y in zip(s.bitrates, s.bitrateReward)}
         s.globalDelayPlayback = GLOBAL_DELAY_PLAYBACK
+        s.maxFileSize = np.amax(s.fileSizes)
 
     def getSegDuration(s, segId):
         assert segId < s.segmentCount
@@ -88,13 +91,12 @@ def loadVideoTime(fileName):
 
     if len(dirname) != 0:
         importlib.sys.path = path
-    
+
     if hasattr(videoInfo, "makePensieveReady") and videoInfo.makePensieveReady:
         return PenseivVideoInfo(videoInfo)
     return VideoInfo(videoInfo)
 
 def dummyVideoInfo():
-    import numpy as np
     class dummy():
         def __init__(s):
             s.bitrates = [200000, 400000, 600000, 800000, 1000000, 1500000, 2500000, 4000000]

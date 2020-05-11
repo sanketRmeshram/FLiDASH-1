@@ -21,6 +21,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import collections as cl
 import sys
+import argparse
 
 from util import load_trace
 import util.videoInfo as video
@@ -35,8 +36,12 @@ from abr.FastMPC import AbrFastMPC
 from abr.RobustMPC import AbrRobustMPC
 from abr.BOLA import BOLA
 from util.cdnUsages import CDN
+from util.segmentRequest import SegmentUsage
+
+from util.SharedLinkEmulator import SharedDownloader
 
 AbrPensieve = None
+SHARED_LINK_ENABLED = False
 
 
 RESULT_DIR = "./results/GenPlots"
@@ -162,11 +167,16 @@ def plotCDNData(cdns):
             'size'   : 22}
 
     figsize=(7, 5)
+
     plt.clf()
     plt.rc('font', **font)
     plt.figure(figsize=figsize, dpi=150)
+
     pltData = {}
     pltTitle = "cdnUploaded"
+    pltCoreTitle = "coreNetworkUsage"
+    pltCoreData = []
+
     for name, res in cdns.items():
         Xs, Ys = list(zip(*res.uploaded))
         savePlotData(Xs, Ys, name, pltTitle)
@@ -175,11 +185,29 @@ def plotCDNData(cdns):
         Xs, Ys = list(zip(*res.uploadRequests))
         savePlotData(Xs, Ys, name + "_cnt", pltTitle)
 
+        Xs, Ys = list(zip(*res.throughputGran(60000)))
+        savePlotData(Xs, Ys, name, pltCoreTitle)
+        pltCoreData += [(Xs, Ys, name)]
+
     plt.legend(ncol = 2, loc = "upper center")
     plt.title(pltTitle)
     dpath = os.path.join(RESULT_DIR, pltTitle.replace(" ", "_"))
     plt.savefig(dpath + "_cmf.eps", bbox_inches="tight")
     plt.savefig(dpath + "_cmf.png", bbox_inches="tight")
+
+    plt.clf()
+    plt.rc('font', **font)
+    plt.figure(figsize=figsize, dpi=150)
+    for x in pltCoreData:
+        plt.plot(x[0], x[1], label=x[2])
+    plt.legend(ncol = 2, loc = "upper center")
+    plt.title(pltCoreTitle)
+    dpath = os.path.join(RESULT_DIR, pltCoreTitle.replace(" ", "_"))
+    plt.savefig(dpath + ".eps", bbox_inches="tight")
+    plt.savefig(dpath + ".png", bbox_inches="tight")
+
+
+
 
 def measureBenefit(results, lonePeers):
     if "FLiDASH" not in results:
@@ -218,6 +246,9 @@ def measureBenefit(results, lonePeers):
 
 GLOBAL_STARTS_AT = 5
 
+def getDict(**kws):
+    return kws
+
 def runExperiments(envCls, traces, vi, network, abr = BOLA, result_dir=None, modelPath = None):
     simulator = Simulator()
     grp = GroupManager(4, len(vi.bitrates)-1, vi, network)#np.random.randint(len(vi.bitrates)))
@@ -228,55 +259,98 @@ def runExperiments(envCls, traces, vi, network, abr = BOLA, result_dir=None, mod
     idxs = [x%len(traces) for x in range(players)] #np.random.randint(len(traces), size=players)
     startsAts = np.random.randint(GLOBAL_STARTS_AT + 1, vi.duration/2, size=players)
     CDN.clear()
+    SegmentUsage.clear()
+
+    sharedLink = None
+    if SHARED_LINK_ENABLED:
+        sharedLink = SharedDownloader(simulator, linkCapa = 10*len(list(network.nodes()))*1000*1000)
     for x, nodeId in enumerate(network.nodes()):
         idx = idxs[x]
         trace = traces[idx]
         startsAt = startsAts[x]
-        env = envCls(vi = vi, traces = trace, simulator = simulator, grp=grp, peerId=nodeId, abr=abr, logpath=result_dir, modelPath=modelPath)
+        env = envCls(vi = vi, traces = trace, simulator = simulator, grp=grp, peerId=nodeId, abr=abr, logpath=result_dir, modelPath=modelPath, sharedLink=sharedLink)
         simulator.runAt(startsAt, env.start, GLOBAL_STARTS_AT)
         ags.append(env)
     simulator.run()
     for i,a in enumerate(ags):
-        assert a._vFinished # or a._vDead
-    return ags, CDN.getInstance() #cdn is singleton, so it is perfectly okay get the instance
+        assert a._vFinished and a._vAgent._vFinished # or a._vDead
+    return ags, CDN.getInstance(), SegmentUsage.getInstance() #cdn is singleton, so it is perfectly okay get the instance
 
-def main():
+def importLearningModules(allowed):
     global AbrPensieve
-    allowed = ["BOLA", "FastMPC", "RobustMPC", "Penseiv", "DHTEnvironment", "FLiDASH"]
-    if "-h" in sys.argv or len(sys.argv) <= 1:
-        print(" ".join(allowed))
-        return
-    allowed = sys.argv[1:]
     if "Penseiv" in allowed and AbrPensieve is None:
         from abr.Pensiev import AbrPensieve as abp
         AbrPensieve = abp
 
+
+def getTestObj(traces, vi, network):
+    testCB = {}
+    #envCls, traces, vi, network, abr = BOLA, result_dir=None, modelPath = None, rnnAgentModule=None, rnnQualityModule=None
+    testCB["BOLA"] = getDict(envCls=Simple, traces=traces, vi=vi, network=network, abr=BOLA)
+    testCB["FastMPC"] = getDict(envCls=Simple, traces=traces, vi=vi, network=network, abr=AbrFastMPC)
+    testCB["RobustMPC"] = getDict(envCls=Simple, traces=traces, vi=vi, network=network, abr=AbrRobustMPC)
+    testCB["Penseiv"] = getDict(envCls=Simple, traces=traces, vi=vi, network=network, abr=AbrPensieve)
+    testCB["DHT"] = getDict(envCls=DHT, traces=traces, vi=vi, network=network)
+    testCB["FLiDASH"] = getDict(envCls=GrpDeterRemote, traces=traces, vi=vi, network=network, abr=BOLA, result_dir=None)
+    testCB["GrpDeterShared"] = getDict(envCls=GroupP2PDeterShared, traces=traces, vi=vi, network=network, abr=BOLA, result_dir=None)
+
+    return testCB
+
+def parseArg(experiments):
+    global EXIT_ON_CRASH, MULTI_PROC, SHARED_LINK_ENABLED
+    parser = argparse.ArgumentParser(description='Experiment')
+    parser.add_argument('--exit-on-crash',  help='Program will exit after first crash', action="store_true")
+    parser.add_argument('--no-slave-proc',  help='No new Process will created for slave', action="store_true")
+    parser.add_argument('--no-quality-rnn-proc',  help='Quality rnn will run in same process as parent', action="store_true")
+    parser.add_argument('--no-agent-rnn-proc',  help='Agent rnn will run in same process as parent', action="store_true")
+    parser.add_argument('--shared-link', help="Add link as sharedLink", action="store_true")
+    parser.add_argument('exp', help=experiments, nargs='+')
+    args = parser.parse_args()
+    EXIT_ON_CRASH = args.exit_on_crash
+    MULTI_PROC = not args.no_slave_proc
+
+    if args.shared_link:
+        SHARED_LINK_ENABLED = True
+
+    if "EXP_ENV_LEARN_PROC_QUALITY" in os.environ:
+        del os.environ["EXP_ENV_LEARN_PROC_QUALITY"]
+    if "EXP_ENV_LEARN_PROC_AGENT" in os.environ:
+        del os.environ["EXP_ENV_LEARN_PROC_AGENT"]
+    if args.no_quality_rnn_proc:
+        os.environ["EXP_ENV_LEARN_PROC_QUALITY"] = "NO"
+    elif args.no_agent_rnn_proc:
+        os.environ["EXP_ENV_LEARN_PROC_AGENT"] = "NO"
+
+    return args.exp
+
+
+def main():
+    allowed = ["BOLA", "FastMPC", "RobustMPC", "Penseiv", "DHT", "FLiDASH", "GrpDeterShared"]
+
+    allowed = parseArg(" ".join([f"'{x}'" for x in allowed]))
+
+    importLearningModules(allowed)
+#     randstate.storeCurrentState() #comment this line to use same state as before
     randstate.loadCurrentState()
     traces = load_trace.load_trace()
     vi = video.loadVideoTime("./videofilesizes/sizes_0b4SVyP0IqI.py")
     assert len(traces[0]) == len(traces[1]) == len(traces[2])
     traces = list(zip(*traces))
     network = P2PNetwork()
-
-    testCB = {}
-    testCB["BOLA"] = (Simple, traces, vi, network, BOLA)
-    testCB["FastMPC"] = (Simple, traces, vi, network, AbrFastMPC)
-    testCB["RobustMPC"] = (Simple, traces, vi, network, AbrRobustMPC)
-    testCB["Penseiv"] = (Simple, traces, vi, network, AbrPensieve)
-    testCB["DHTEnvironment"] = (DHT, traces, vi, network)
-    testCB["FLiDASH"] = (FLiDASH, traces, vi, network, BOLA, None)
-
+    testCB = getTestObj(traces, vi, network)
     results = {}
     cdns = {}
+    segUses = {}
 
 #     for name, cb in testCB.items():
     for name in allowed:
         assert name in testCB
         cb = testCB[name]
         randstate.loadCurrentState()
-        ags, cdn = runExperiments(*cb)
+        ags, cdn, segUse = runExperiments(**cb)
         results[name] = ags
         cdns[name] = cdn
+        segUses[name] = segUse
 
     print("ploting figures")
     print("="*30)
@@ -287,7 +361,7 @@ def main():
     plotAgentsData(results, "_vAgent.avgBitrate", "Average bitrate played", "Player Id", lonePeers)
     plotAgentsData(results, "_vAgent.avgQualityIndex", "Average quality index played", "Player Id", lonePeers)
     plotAgentsData(results, "_vAgent.avgQualityIndexVariation", "Average quality index variation", "Player Id", lonePeers)
-    plotAgentsData(results, "_vAgent.totalStallTime", "Stall Time", "Player Id", lonePeers)
+    plotAgentsData(results, "_vAgent.avgStallTime", "Stall Time", "Player Id", lonePeers)
     plotAgentsData(results, "_vAgent.startUpDelay", "Start up delay", "Player Id", lonePeers)
     plotAgentsData(results, "idleTime", "IdleTime", "Player Id", lonePeers)
     plotAgentsData(results, "_vAgent.avgBitrateVariation", "Average Bitrate Variation", "Player Id", lonePeers)

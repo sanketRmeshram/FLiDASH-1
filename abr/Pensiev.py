@@ -29,10 +29,16 @@ import numpy as np
 import time
 import itertools
 import tensorflow as tf
-import a3c
+from util import a3c
+from util.myprint import myprint
+import traceback as tb
+from util.misc import getTraceBack
 
 from util.calculateMetric import measureQoE
-from util.multiprocwrap import Process, Pipe
+# from util.multiprocwrap import Process, Pipe
+import util.multiprocwrap as mp
+import atexit
+
 
 ######################## FAST MPC #######################
 
@@ -80,6 +86,8 @@ class AbrPensieve:
 
     def stopAbr(self):
         if self.abr:
+            self.abr.stopAbr()
+#             myprint("="*30, "\n", sys.getrefcount(self.abr),  "\n", "="*30)
             self.abr = None
 
     def getSleepTime(self, buflen):
@@ -98,7 +106,7 @@ class AbrPensieve:
 
         post_data = {
                 'lastquality': self.agent._vLastBitrateIndex,
-                'RebufferTime': self.agent._vTotalStallTime,
+                'RebufferTime': self.agent._vTotalStallTime * M_IN_K,
                 'lastChunkFinishTime': req.downloadFinished * M_IN_K,
                 'lastChunkStartTime': req.downloadStarted * M_IN_K,
                 'lastChunkSize': req.clen,
@@ -120,6 +128,7 @@ class AbrPensieveClass:
     def getInstance(videoInfo, agent, log_file_path=LOG_FILE, *kw, **kws):
         if AbrPensieveClass.__instance == None:
             AbrPensieveClass(videoInfo, agent, log_file_path, *kw, **kws)
+        AbrPensieveClass.__instance.count += 1
         return AbrPensieveClass.__instance
 
     @staticmethod
@@ -128,7 +137,81 @@ class AbrPensieveClass:
 
     def __init__(self, videoInfo, agent, log_file_path=LOG_FILE, *kw, **kws):
         assert AbrPensieveClass.__instance == None
+        self.recv = mp.Queue()
+        self.send = mp.Queue()
+        self.proc = mp.Process(target=self.handle, args=(self.send, self.recv, videoInfo, agent, log_file_path) + kw, kwargs=kws)
+        self.proc.start()
         AbrPensieveClass.__instance = self
+        self.count = 0
+        self.agents = []
+        atexit.register(self.cleanup)
+
+    def handle(self, recv, send, *args, **kwargs):
+        self.orig = AbrPensieveClassProc(*args, **kwargs)
+        funcs = { func : getattr(self.orig, func) for func in dir(self.orig) if not func.startswith("__") and not func.endswith("__") and callable(getattr(self.orig, func)) }
+        while True:
+            func, args, kwargs = recv.get()
+            try:
+                if func in funcs:
+                    res = funcs[func](*args, **kwargs)
+                    send.put({"st": True, "res": res})
+                elif func == "cleanup":
+                    send.put({"st": True, "res":"exit"})
+                    myprint("proc cleanup")
+                    recv = None
+                    send = None
+                    return
+                else:
+                    send.put({"st": True, "res":None})
+                    myprint("unknown:", func, args, kwargs)
+
+            except:
+                trace = sys.exc_info()
+                simpTrace = getTraceBack(trace)
+                send.put({"st": False, "trace": simpTrace})
+                myprint(simpTrace)
+
+    def _rSend(self, dt):
+        self.send.put(dt)
+    def _rRecv(self):
+        dt = self.recv.get(timeout=60)
+        if not dt.get("st", False):
+            myprint(dt.get("trace", ""))
+            raise Exception(dt.get("trace", ""))
+        return dt["res"]
+
+    def do_POST(self, *args, **kwargs):
+        self._rSend(("do_POST", args, kwargs))
+        return self._rRecv()
+
+    def get_chunk_size(self, *args, **kwargs):
+        self._rSend(("get_chunk_size", args, kwargs))
+        return self._rRecv()
+
+    def stopAbr(self):
+
+        self.count -= 1
+        if self.count != 0:
+            return
+
+        if self.proc:
+            self._rSend(("cleanup", None, None))
+            self.send = None
+            pop = self._rRecv()
+            self.recv = None
+            self.proc.join()
+            self.proc = None
+            AbrPensieveClass.__instance = None
+            myprint("="*30, "cleaned up", "="*30, sep="\n")
+#             import pdb; pdb.set_trace()
+            return pop
+
+    def cleanup(self):
+        while self.count > 0:
+            self.stopAbr()
+
+class AbrPensieveClassProc:
+    def __init__(self, videoInfo, agent, log_file_path=LOG_FILE, *kw, **kws):
         self.video = None
         #=====================================
         # SETUP
