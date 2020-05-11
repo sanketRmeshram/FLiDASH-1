@@ -59,7 +59,6 @@ class FLiDASH(Simple):
         self._vFinished = False
         self._vModelPath = modelPath
         self._vRunWhenDownloadCompeltes = []
-        self._vEmailPass = open("emailpass.txt").read().strip()
 
         self._vGroupNodes = None
 

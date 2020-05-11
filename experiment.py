@@ -27,7 +27,8 @@ from util import load_trace
 import util.videoInfo as video
 from util.p2pnetwork import P2PNetwork
 import util.randStateInit as randstate
-from simenv.FLiDASH import FLiDASH
+from simenv.FLiDASH import FLiDASH as FLiDASH
+from simenv.FLiDASHShared import FLiDASHShared
 from simenv.Simple import Simple
 from simenv.DHT import DHT
 from simulator.simulator import Simulator
@@ -109,7 +110,7 @@ def plotStoredData(legends, _, pltTitle, xlabel):
 def findIgnorablePeers(results):
     p = set()
     for name, res in results.items():
-        if name not in ["FLiDASH"]:
+        if name not in ["FLiDASH", "FLiDASHShared"]:
             continue
         for ag in res:
             if not ag._vGroup or ag._vGroup.isLonepeer(ag) or len(ag._vGroupNodes) <= 1:
@@ -291,9 +292,9 @@ def getTestObj(traces, vi, network):
     testCB["RobustMPC"] = getDict(envCls=Simple, traces=traces, vi=vi, network=network, abr=AbrRobustMPC)
     testCB["Penseiv"] = getDict(envCls=Simple, traces=traces, vi=vi, network=network, abr=AbrPensieve)
     testCB["DHT"] = getDict(envCls=DHT, traces=traces, vi=vi, network=network)
-    testCB["FLiDASH"] = getDict(envCls=GrpDeterRemote, traces=traces, vi=vi, network=network, abr=BOLA, result_dir=None)
-    testCB["GrpDeterShared"] = getDict(envCls=GroupP2PDeterShared, traces=traces, vi=vi, network=network, abr=BOLA, result_dir=None)
-
+    testCB["FLiDASH"] = getDict(envCls=FLiDASH, traces=traces, vi=vi, network=network, abr=BOLA, result_dir=None)
+    testCB["FLiDASHShared"] = getDict(envCls=FLiDASHShared, traces=traces, vi=vi, network=network, abr=BOLA, result_dir=None)
+    
     return testCB
 
 def parseArg(experiments):
@@ -325,7 +326,7 @@ def parseArg(experiments):
 
 
 def main():
-    allowed = ["BOLA", "FastMPC", "RobustMPC", "Penseiv", "DHT", "FLiDASH", "GrpDeterShared"]
+    allowed = ["BOLA", "FastMPC", "RobustMPC", "Penseiv", "DHT", "FLiDASH", "FLiDASHShared"]
 
     allowed = parseArg(" ".join([f"'{x}'" for x in allowed]))
 
